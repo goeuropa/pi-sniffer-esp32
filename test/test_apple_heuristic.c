@@ -112,6 +112,33 @@ static void test_nearby_info_ipad(void) {
     CHECK(strncmp(d.name, "iPad", 4) == 0, "Nearby Info di=0,info=0x1d names it an iPad");
 }
 
+static void test_nearby_info_macbook(void) {
+    ble_device_t d = make_blank_device();
+
+    // device_bit=0, information_byte=0x19 - confirmed MacBook Air (observed
+    // appearing/disappearing in lockstep with toggling the laptop's
+    // Bluetooth off and on).
+    uint8_t payload[] = {0x10, 0x06, 0x00, 0x19, 0x00, 0x00};
+    apple_heuristic_process(&d, payload, sizeof(payload));
+
+    CHECK(d.category == CATEGORY_COMPUTER, "Nearby Info di=0,info=0x19 decodes as a computer");
+    CHECK(strncmp(d.name, "MacBook", 7) == 0, "Nearby Info di=0,info=0x19 names it a MacBook");
+}
+
+static void test_nearby_info_macbook_other_device_bit(void) {
+    ble_device_t d = make_blank_device();
+
+    // device_bit=1, information_byte=0x19 - inferred (not independently
+    // confirmed like di=019 above) by the same pattern already established
+    // for iPad, where a device type spans both device_bit values for the
+    // same information_byte.
+    uint8_t payload[] = {0x10, 0x06, 0x02, 0x19, 0x00, 0x00};
+    apple_heuristic_process(&d, payload, sizeof(payload));
+
+    CHECK(d.category == CATEGORY_COMPUTER, "Nearby Info di=1,info=0x19 decodes as a computer");
+    CHECK(strncmp(d.name, "MacBook", 7) == 0, "Nearby Info di=1,info=0x19 names it a MacBook");
+}
+
 static void test_nearby_info_watch(void) {
     ble_device_t d = make_blank_device();
 
@@ -175,6 +202,8 @@ int main(void) {
     test_magic_switch_names_iwatch();
     test_nearby_info_iphone();
     test_nearby_info_ipad();
+    test_nearby_info_macbook();
+    test_nearby_info_macbook_other_device_bit();
     test_nearby_info_watch();
     test_nearby_info_too_short_is_ignored();
     test_name_confidence_precedence();

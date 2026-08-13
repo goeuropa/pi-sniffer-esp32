@@ -97,6 +97,52 @@ void device_set_name(ble_device_t *device, const char *value, name_confidence_t 
     }
 }
 
+static void store_stream_payload(stream_window_t *slot, const uint8_t *payload, uint8_t payload_len) {
+    if (payload == NULL) {
+        slot->payload_len = 0;
+        return;
+    }
+    uint8_t n = payload_len;
+    if (n > STREAM_PAYLOAD_MAX_LEN) {
+        n = STREAM_PAYLOAD_MAX_LEN;
+    }
+    memcpy(slot->payload, payload, n);
+    slot->payload_len = n;
+}
+
+void device_record_stream(ble_device_t *device, uint8_t stream_type, time_t when,
+                           const uint8_t *payload, uint8_t payload_len) {
+    for (int i = 0; i < device->stream_count; i++) {
+        if (device->streams[i].type == stream_type) {
+            device->streams[i].last_seen = when;
+            store_stream_payload(&device->streams[i], payload, payload_len);
+            return;
+        }
+    }
+
+    if (device->stream_count < MAC_PACK_MAX_TRACKED_STREAMS) {
+        stream_window_t *slot = &device->streams[device->stream_count++];
+        slot->type = stream_type;
+        slot->first_seen = when;
+        slot->last_seen = when;
+        store_stream_payload(slot, payload, payload_len);
+        return;
+    }
+
+    // Table full and stream_type isn't already tracked: evict the
+    // least-recently-seen slot to make room.
+    int lru_index = 0;
+    for (int i = 1; i < MAC_PACK_MAX_TRACKED_STREAMS; i++) {
+        if (device->streams[i].last_seen < device->streams[lru_index].last_seen) {
+            lru_index = i;
+        }
+    }
+    device->streams[lru_index].type = stream_type;
+    device->streams[lru_index].first_seen = when;
+    device->streams[lru_index].last_seen = when;
+    store_stream_payload(&device->streams[lru_index], payload, payload_len);
+}
+
 ble_device_t* device_find(device_list_t *list, const uint8_t *mac) {
     for (int i = 0; i < MAX_DEVICES; i++) {
         if (list->devices[i].active && 
@@ -369,6 +415,12 @@ void device_get_summary(const device_list_t *list, device_summary_t *summary) {
         }
         if (list->devices[i].has_superseded_by) {
             continue;  // MAC-rotated ghost, already counted under its newer MAC
+        }
+        if (list->devices[i].seen_count < DEVICE_MIN_SEEN_COUNT_FOR_SUMMARY) {
+            continue;  // one-off blip, not enough evidence of a real device yet
+        }
+        if (list->devices[i].raw_rssi < MIN_RSSI_FOR_SUMMARY) {
+            continue;  // signal too weak to trust - risk of a misdecoded MAC
         }
 
         summary->total_devices++;

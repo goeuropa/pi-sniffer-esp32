@@ -32,6 +32,7 @@
 #include "http_client.h"
 #include "device.h"
 #include "mac_pack.h"
+#include "gnss.h"
 
 static const char *TAG = "BLE_SNIFFER";
 
@@ -67,7 +68,13 @@ static void on_device_discovered(const uint8_t *mac,
         ESP_LOGW(TAG, "Device list full, could not add device");
         return;
     }
-    
+
+#if PHONES_ONLY
+    if (device->category != CATEGORY_PHONE) {
+        return;
+    }
+#endif
+
 #if DEBUG_LOGGING
     char mfg_buf[8];
 
@@ -152,6 +159,11 @@ static void print_summary(void) {
         if (!device->active) {
             continue;
         }
+#if PHONES_ONLY
+        if (device->category != CATEGORY_PHONE) {
+            continue;
+        }
+#endif
         char mfg_buf[8];
         char superseded_buf[32] = "";
         if (device->has_superseded_by) {
@@ -171,7 +183,22 @@ static void print_summary(void) {
             snprintf(tx_buf, sizeof(tx_buf), "%d", device->tx_power);
         }
 
-        ESP_LOGI(TAG, "  %s  %-5s  RSSI:%4d  TX:%4s  dist:%5.1fm  seen:%3lu  window:%9s  %-20s  %s%s",
+#if DEBUG_STREAM_WINDOWS
+        char streams_buf[128] = "";
+        if (device->stream_count > 0) {
+            int used = snprintf(streams_buf, sizeof(streams_buf), "  streams:");
+            for (int s = 0; s < device->stream_count && used > 0 && (size_t)used < sizeof(streams_buf); s++) {
+                used += snprintf(streams_buf + used, sizeof(streams_buf) - used, " %02x[%lds-%lds]",
+                                  device->streams[s].type,
+                                  (long)(now - device->streams[s].first_seen),
+                                  (long)(now - device->streams[s].last_seen));
+            }
+        }
+#else
+        static const char streams_buf[1] = "";
+#endif
+
+        ESP_LOGI(TAG, "  %s  %-5s  RSSI:%4d  TX:%4s  dist:%5.1fm  seen:%3lu %9s  %-20s  %s%s%s",
                  device->mac_str,
                  category_to_string(device->category),
                  device->raw_rssi,
@@ -181,7 +208,8 @@ static void print_summary(void) {
                  window_buf,
                  manufacturer_to_string(device->has_manufacturer_data, device->manufacturer_id, mfg_buf, sizeof(mfg_buf)),
                  device->name[0] ? device->name : "",
-                 superseded_buf);
+                 superseded_buf,
+                 streams_buf);
     }
     ESP_LOGI(TAG, "======================");
 }
@@ -223,9 +251,17 @@ static void on_button_event(button_event_t event) {
 static void report_task(void *pvParameters) {
     while (1) {
         time_t now = time(NULL);
-        
-        // Check if it's time to report
-        if (now - last_report_time >= REPORT_INTERVAL_SEC) {
+
+        bool time_to_report = (now - last_report_time >= REPORT_INTERVAL_SEC);
+        bool scan_in_progress = (ble_scanner_get_status() == SCANNER_RUNNING);
+
+        // Wait for the current scan to finish before touching device_list,
+        // so report processing (cleanup/mac_pack/summary/API send) never
+        // runs concurrently with the BLE stack delivering scan results into
+        // it via on_device_discovered(). A report due mid-scan just waits
+        // for the next 1s poll rather than being skipped - last_report_time
+        // is only updated once the report actually runs.
+        if (time_to_report && !scan_in_progress) {
             // Clean up stale devices
             int removed = device_cleanup(&device_list, MAX_DEVICE_AGE_SEC);
             if (removed > 0) {
@@ -374,7 +410,18 @@ static void run_normal_mode(wifi_credentials_t *creds) {
         ESP_LOGE(TAG, "BLE scanner init failed!");
         return;
     }
-    
+
+#if ENABLE_GNSS
+    // Initialize GNSS (SIM7670G onboard modem) - independent of WiFi/BLE,
+    // logs fixes on its own cadence (GNSS_POLL_INTERVAL_SEC)
+    ESP_LOGI(TAG, "Initializing GNSS...");
+    if (gnss_init()) {
+        gnss_start_task();
+    } else {
+        ESP_LOGW(TAG, "GNSS init failed, continuing without GNSS");
+    }
+#endif
+
     ESP_LOGI(TAG, "Starting scan and report tasks...");
     
     // Initialize last report time

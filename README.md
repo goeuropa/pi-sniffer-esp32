@@ -18,6 +18,13 @@ A simplified version of pi-sniffer designed specifically for ESP32 devices. This
 - ESP32 development board (ESP32-WROOM-32, ESP32-DevKitC, etc.)
 - USB cable for programming and power
 
+### ESP32-S3 SIM7670G board (GNSS)
+
+GNSS support (see [gnss.c](src/gnss.c)/[gnss.h](include/gnss.h)) targets the
+Waveshare ESP32-S3 SIM7670G 4G development board. Board docs (pinout,
+ESP-IDF setup, GNSS notes) are here:
+https://docs.waveshare.com/ESP32-S3-SIM7670G-4G/ESP-IDF
+
 ## First-Time Setup
 
 1. **Flash the firmware** to your ESP32

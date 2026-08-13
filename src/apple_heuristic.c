@@ -31,6 +31,7 @@
 #include "esp_log.h"
 #else
 #define ESP_LOGI(tag, fmt, ...) printf("I (%s) " fmt "\n", tag, ##__VA_ARGS__)
+#define ESP_LOGD(tag, fmt, ...) printf("D (%s) " fmt "\n", tag, ##__VA_ARGS__)
 #endif
 
 static const char *TAG = "APPLE_HEUR";
@@ -47,6 +48,7 @@ void apple_heuristic_process(ble_device_t *device, const uint8_t *payload, uint8
     }
 
     uint8_t apple_device_type = payload[0];
+    device_record_stream(device, apple_device_type, device->last_seen, payload, payload_len);
 
     switch (apple_device_type) {
         case 0x01:
@@ -184,6 +186,21 @@ void apple_heuristic_process(ble_device_t *device, const uint8_t *payload, uint8
                 // Seems to be Apple Watch
                 guessed_category = CATEGORY_WATCH;
                 snprintf(temp_name, sizeof(temp_name), "Apple di=%.1x%.2x", device_bit, information_byte);
+            } else if (device_bit == 0x0 && information_byte == 0x19) {
+                // Confirmed MacBook Air: observed di=019 appear/disappear in
+                // lockstep with toggling the laptop's Bluetooth off and on.
+                guessed_category = CATEGORY_COMPUTER;
+                snprintf(temp_name, sizeof(temp_name), "MacBook di=%.1x%.2x", device_bit, information_byte);
+            } else if (device_bit == 0x1 && information_byte == 0x19) {
+                // Inferred, not independently confirmed the way di=019 was:
+                // same information_byte as the confirmed MacBook Air above,
+                // just a different device_bit - following the same pattern
+                // already established for iPad below (di=01d and di=11d
+                // both map to iPad; device_bit appears to be a state/
+                // modifier bit, not a type differentiator). Likely the same
+                // MacBook Air in a different state (e.g. lid open/closed).
+                guessed_category = CATEGORY_COMPUTER;
+                snprintf(temp_name, sizeof(temp_name), "MacBook di=%.1x%.2x", device_bit, information_byte);
             } else if (device_bit == 0x0 && information_byte == 0x1c) {
                 snprintf(temp_name, sizeof(temp_name), "Apple di=%.1x%.2x", device_bit, information_byte);
             } else if (device_bit == 0x1 && information_byte == 0x1c && activity_bits == 0x11) {

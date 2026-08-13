@@ -11,6 +11,7 @@ idf_component_register(
         "captive_dns.c"
         "button_handler.c"
         "http_client.c"
+        "gnss.c"
     INCLUDE_DIRS 
         "."
         "../include"

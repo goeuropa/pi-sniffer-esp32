@@ -38,7 +38,7 @@ static const char *TAG = "BLE_SNIFFER";
 // Global device list
 static device_list_t device_list;
 
-// Device ID for this sensor (derived from WiFi MAC)
+// Device ID for this sensor (derived from WiFi MAC or platformio.ini)
 static char device_id[32];
 
 // Last report time
@@ -71,11 +71,7 @@ static void on_device_discovered(const uint8_t *mac,
 #if DEBUG_LOGGING
     char mfg_buf[8];
 
-    // Hex-dump the raw manufacturer-specific payload (beyond just the 2-byte
-    // company ID) so unrecognized devices - e.g. a Samsung TV that only
-    // reports as "phone" - can be investigated and correlated against real
-    // captured samples, the same way the original pi-sniffer's manufacturer
-    // heuristics were built up from observed byte patterns.
+    // Hex-dump the raw manufacturer-specific payload
     char payload_hex[48] = "";
     if (manufacturer_payload != NULL && manufacturer_payload_len > 0) {
         uint8_t n = manufacturer_payload_len;
@@ -193,7 +189,6 @@ static void on_button_event(button_event_t event) {
     switch (event) {
         case BUTTON_EVENT_DOUBLE_PRESS:
             ESP_LOGW(TAG, "Double-press detected! Entering config mode...");
-            // Clear credentials and reboot into config mode
             wifi_provision_clear_credentials();
             vTaskDelay(500 / portTICK_PERIOD_MS);
             wifi_provision_reboot();
@@ -208,7 +203,6 @@ static void on_button_event(button_event_t event) {
             break;
             
         case BUTTON_EVENT_SINGLE_PRESS:
-            // Print summary on single press
             print_summary();
             break;
             
@@ -224,24 +218,19 @@ static void report_task(void *pvParameters) {
     while (1) {
         time_t now = time(NULL);
         
-        // Check if it's time to report
         if (now - last_report_time >= REPORT_INTERVAL_SEC) {
-            // Clean up stale devices
             int removed = device_cleanup(&device_list, MAX_DEVICE_AGE_SEC);
             if (removed > 0) {
                 ESP_LOGI(TAG, "Removed %d stale devices", removed);
             }
 
 #if ENABLE_MAC_PACKING
-            // Detect MAC-rotated devices so they aren't double-counted
             mac_pack_run(&device_list);
 #endif
 
-            // Print summary
             print_summary();
             
 #if !DISABLE_API_SEND
-            // Send to REST API if connected
             if (wifi_is_connected()) {
                 ESP_LOGI(TAG, "Sending device data to API...");
                 if (http_send_devices(&device_list, device_id)) {
@@ -268,13 +257,11 @@ static void report_task(void *pvParameters) {
  */
 static void scan_task(void *pvParameters) {
     while (1) {
-        // Start a scan cycle
         if (ble_scanner_get_status() != SCANNER_RUNNING) {
             ESP_LOGI(TAG, "Starting BLE scan for %d seconds", SCAN_DURATION_SEC);
             ble_scanner_start(SCAN_DURATION_SEC, on_device_discovered);
         }
 
-        // Wait for scan to complete
         vTaskDelay((SCAN_DURATION_SEC + 1) * 1000 / portTICK_PERIOD_MS);
     }
 }
@@ -292,13 +279,11 @@ static void run_provisioning_mode(void) {
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "=================================");
     
-    // Start the captive portal
     if (!wifi_provision_start_portal()) {
         ESP_LOGE(TAG, "Failed to start provisioning portal!");
         return;
     }
     
-    // Wait indefinitely - the portal will reboot when configured
     while (1) {
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
@@ -312,35 +297,34 @@ static void run_normal_mode(wifi_credentials_t *creds) {
     ESP_LOGI(TAG, "   ESP32 BLE Sniffer Starting");
     ESP_LOGI(TAG, "=================================");
     
-    // Initialize device list
     device_list_init(&device_list);
     
-    // Initialize WiFi
     ESP_LOGI(TAG, "Initializing WiFi...");
     if (!wifi_manager_init()) {
         ESP_LOGE(TAG, "WiFi init failed!");
         return;
     }
     
-    // Connect to configured WiFi
     ESP_LOGI(TAG, "Connecting to WiFi: %s", creds->ssid);
     wifi_connect(creds->ssid, creds->password);
     
     if (wifi_wait_connected(30000)) {
         ESP_LOGI(TAG, "WiFi connected!");
         
-        // Get device ID from MAC address
+        // --- USTALANIE NAZWY URZĄDZENIA (DEVICE ID) ---
+#ifdef DEVICE_NAME
+        // Użyj własnej nazwy z zdefiniowanej w platformio.ini
+        snprintf(device_id, sizeof(device_id), "%s", DEVICE_NAME);
+#else
+        // Domyślnie utwórz nazwę na podstawie adresu MAC
         char mac_str[18];
         if (wifi_get_mac(mac_str)) {
-            // Create device ID from MAC (use last 6 hex digits without colons)
-            // mac_str format: "XX:XX:XX:XX:XX:XX"
             device_id[0] = 'E';
             device_id[1] = 'S';
             device_id[2] = 'P';
             device_id[3] = '3';
             device_id[4] = '2';
             device_id[5] = '_';
-            // Copy last 6 hex chars (positions 9,10,12,13,15,16)
             device_id[6] = mac_str[9];
             device_id[7] = mac_str[10];
             device_id[8] = mac_str[12];
@@ -351,9 +335,9 @@ static void run_normal_mode(wifi_credentials_t *creds) {
         } else {
             strcpy(device_id, "ESP32_UNKNOWN");
         }
+#endif
         ESP_LOGI(TAG, "Device ID: %s", device_id);
         
-        // Initialize SNTP for time sync
         init_sntp();
     } else {
         ESP_LOGW(TAG, "WiFi connection failed!");
@@ -361,14 +345,11 @@ static void run_normal_mode(wifi_credentials_t *creds) {
         strcpy(device_id, "ESP32_OFFLINE");
     }
     
-    // Initialize HTTP client
     http_client_init();
     
-    // Initialize button handler for runtime double-press detection
     button_handler_init();
     button_handler_register_callback(on_button_event);
     
-    // Initialize BLE scanner
     ESP_LOGI(TAG, "Initializing BLE scanner...");
     if (!ble_scanner_init()) {
         ESP_LOGE(TAG, "BLE scanner init failed!");
@@ -377,13 +358,9 @@ static void run_normal_mode(wifi_credentials_t *creds) {
     
     ESP_LOGI(TAG, "Starting scan and report tasks...");
     
-    // Initialize last report time
     last_report_time = time(NULL);
     
-    // Create scan task
     xTaskCreate(scan_task, "scan_task", 4096, NULL, 5, NULL);
-    
-    // Create report task
     xTaskCreate(report_task, "report_task", 8192, NULL, 4, NULL);
     
     ESP_LOGI(TAG, "=================================");
@@ -400,40 +377,26 @@ static void run_normal_mode(wifi_credentials_t *creds) {
  * Main application entry point
  */
 void app_main(void) {
-    // The runtime log level defaults to INFO (CONFIG_LOG_DEFAULT_LEVEL_INFO
-    // in sdkconfig) even though DEBUG-level logs are compiled in
-    // (CONFIG_LOG_MAXIMUM_LEVEL_DEBUG) - override individual tags here to
-    // surface their ESP_LOGD output without changing the default for
-    // everything else. Use esp_log_level_set("*", ESP_LOG_DEBUG) instead to
-    // raise every tag at once.
-    // esp_log_level_set("APPLE_HEUR", ESP_LOG_DEBUG);
-
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "   ESP32 BLE Sniffer v1.1");
     ESP_LOGI(TAG, "========================================");
 
-    // Initialize provisioning system (NVS)
     if (!wifi_provision_init()) {
         ESP_LOGE(TAG, "Failed to initialize provisioning!");
         return;
     }
     
-    // Check for double-press at boot to enter config mode
-    // Give user 3 seconds to double-press the BOOT button
     config_mode = button_check_double_press_boot(3000);
     
-    // Also enter config mode if no credentials are stored
     if (!config_mode && !wifi_provision_has_credentials()) {
         ESP_LOGI(TAG, "No WiFi credentials found, entering config mode");
         config_mode = true;
     }
     
     if (config_mode) {
-        // Run WiFi provisioning portal
         run_provisioning_mode();
     } else {
-        // Load credentials and run normal mode
         wifi_credentials_t creds;
         if (wifi_provision_load_credentials(&creds)) {
             run_normal_mode(&creds);

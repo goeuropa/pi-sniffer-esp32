@@ -151,6 +151,36 @@ typedef struct {
 } device_summary_t;
 
 /**
+ * Device count broken down by distance, within one category. Buckets match
+ * DISTANCE_BUCKET_NEAR_M/DISTANCE_BUCKET_MID_M (config.h): near = [0,
+ * DISTANCE_BUCKET_NEAR_M), mid = [DISTANCE_BUCKET_NEAR_M,
+ * DISTANCE_BUCKET_MID_M), far = [DISTANCE_BUCKET_MID_M, +inf).
+ */
+typedef struct {
+    int near;
+    int mid;
+    int far;
+} distance_breakdown_t;
+
+/**
+ * Per-category distance breakdown, parallel to device_summary_t (same
+ * categories, same "other" catch-all, same counting rules as
+ * device_get_summary() - see device_get_distance_summary()). Display-only -
+ * unlike device_summary_t, this isn't part of the reported JSON payload.
+ */
+typedef struct {
+    distance_breakdown_t phones;
+    distance_breakdown_t computers;
+    distance_breakdown_t wearables;
+    distance_breakdown_t tablets;
+    distance_breakdown_t beacons;
+    distance_breakdown_t watches;
+    distance_breakdown_t headphones;
+    distance_breakdown_t speakers;
+    distance_breakdown_t other;
+} device_distance_summary_t;
+
+/**
  * Initialize the device list
  * @param list Pointer to the device list
  */
@@ -246,6 +276,15 @@ void device_categorize(ble_device_t *device);
  * @param summary Pointer to summary structure to fill
  */
 void device_get_summary(const device_list_t *list, device_summary_t *summary);
+
+/**
+ * Get the per-category distance breakdown for the device list - same
+ * counting rules as device_get_summary() (see its doc comment), just
+ * additionally bucketed by distance within each category.
+ * @param list Pointer to the device list
+ * @param summary Pointer to distance-summary structure to fill
+ */
+void device_get_distance_summary(const device_list_t *list, device_distance_summary_t *summary);
 
 /**
  * Convert MAC bytes to string

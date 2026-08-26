@@ -205,10 +205,11 @@ bool gnss_parse_cgnssinfo(const char *line, gnss_fix_t *out) {
 // ----------------------------------------------------------------------
 #ifdef ESP_PLATFORM
 
+#include <sys/time.h>
+
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "driver/uart.h"
 #include "esp_log.h"
+#include "modem_uart.h"
 
 static const char *TAG = "GNSS";
 
@@ -218,107 +219,16 @@ static portMUX_TYPE s_fix_lock = portMUX_INITIALIZER_UNLOCKED;
 #define GNSS_AT_BUF_SIZE 512
 #define GNSS_AT_TIMEOUT_MS 5000
 
-/**
- * Write an AT command (CR/LF appended) and read back the modem's response
- * until "OK"/"ERROR" is seen or the timeout elapses.
- * @return number of bytes read into resp (0-terminated), or -1 on failure/timeout
- */
-static int gnss_send_at(const char *cmd, char *resp, size_t resp_size, int timeout_ms) {
-    char line[128];
-    int cmd_len = snprintf(line, sizeof(line), "%s\r\n", cmd);
-    uart_flush_input(GNSS_UART_NUM);
-    uart_write_bytes(GNSS_UART_NUM, line, cmd_len);
-
-    size_t total = 0;
-    TickType_t start = xTaskGetTickCount();
-    TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
-
-    while ((xTaskGetTickCount() - start) < timeout_ticks && total < resp_size - 1) {
-        int n = uart_read_bytes(GNSS_UART_NUM, (uint8_t *)resp + total,
-                                 resp_size - 1 - total, pdMS_TO_TICKS(200));
-        if (n > 0) {
-            total += n;
-            resp[total] = '\0';
-            if (strstr(resp, "OK\r\n") != NULL || strstr(resp, "ERROR") != NULL) {
-                break;
-            }
-        }
-    }
-    resp[total] = '\0';
-
-    if (total == 0) {
-        return -1;
-    }
-    return (int)total;
-}
-
 bool gnss_init(void) {
-    uart_config_t uart_config = {
-        .baud_rate = GNSS_UART_BAUD,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
-    };
-
-    esp_err_t err = uart_driver_install(GNSS_UART_NUM, GNSS_AT_BUF_SIZE * 2, 0, 0, NULL, 0);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "uart_driver_install failed: %s", esp_err_to_name(err));
-        return false;
-    }
-    err = uart_param_config(GNSS_UART_NUM, &uart_config);
-    if (err == ESP_OK) {
-        err = uart_set_pin(GNSS_UART_NUM, GNSS_UART_TX_PIN, GNSS_UART_RX_PIN,
-                            UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-    }
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "UART config failed: %s", esp_err_to_name(err));
-        uart_driver_delete(GNSS_UART_NUM);
+    // UART setup and the initial "AT" handshake are shared with cellular.c
+    // over the modem's single AT command port - see modem_uart.h. Safe to
+    // call even if cellular.c has already brought the link up.
+    if (!modem_uart_init()) {
         return false;
     }
 
-    ESP_LOGI(TAG, "Waiting %ds for modem to boot...", GNSS_POWERON_WAIT_SEC);
-    vTaskDelay(pdMS_TO_TICKS(GNSS_POWERON_WAIT_SEC * 1000));
-
-    // Combo LTE+GNSS modems can take a while to come up from a cold boot
-    // (well past the initial GNSS_POWERON_WAIT_SEC), and if the board gates
-    // modem power behind a physical switch/jumper rather than a PWRKEY GPIO,
-    // AT will simply never respond until that's addressed. Be patient here -
-    // GNSS_AT_SYNC_ATTEMPTS attempts, GNSS_AT_SYNC_RETRY_MS apart - and log
-    // every attempt so it's obvious whether the modem is silent (no bytes at
-    // all - likely unpowered or wrong pins) or almost there (garbled/partial
-    // bytes - likely wrong baud, or a boot banner not yet followed by "OK").
     char resp[GNSS_AT_BUF_SIZE];
-    bool synced = false;
-    for (int attempt = 0; attempt < GNSS_AT_SYNC_ATTEMPTS; attempt++) {
-        int n = gnss_send_at("AT", resp, sizeof(resp), 1000);
-        if (n > 0 && strstr(resp, "OK") != NULL) {
-            synced = true;
-            break;
-        }
-        if (n > 0) {
-            char hex[3 * 32 + 1] = "";
-            int shown = n < 32 ? n : 32;
-            for (int i = 0; i < shown; i++) {
-                snprintf(hex + i * 3, 4, "%02X ", (uint8_t)resp[i]);
-            }
-            ESP_LOGW(TAG, "AT attempt %d/%d: got %d byte(s), no OK: [%s] \"%s\"",
-                     attempt + 1, GNSS_AT_SYNC_ATTEMPTS, n, hex, resp);
-        } else {
-            ESP_LOGW(TAG, "AT attempt %d/%d: no bytes received", attempt + 1, GNSS_AT_SYNC_ATTEMPTS);
-        }
-        vTaskDelay(pdMS_TO_TICKS(GNSS_AT_SYNC_RETRY_MS));
-    }
-    if (!synced) {
-        ESP_LOGE(TAG, "Modem did not respond to AT after %ds total - check GNSS_UART_TX_PIN/"
-                 "GNSS_UART_RX_PIN in config.h, and check the board for a physical 4G/modem "
-                 "power switch or DIP switch that must be enabled",
-                 GNSS_POWERON_WAIT_SEC + (GNSS_AT_SYNC_ATTEMPTS * GNSS_AT_SYNC_RETRY_MS) / 1000);
-        return false;
-    }
-
-    if (gnss_send_at("AT+CGNSSPWR=1", resp, sizeof(resp), GNSS_AT_TIMEOUT_MS) < 0 ||
+    if (!modem_uart_send_at("AT+CGNSSPWR=1", resp, sizeof(resp), GNSS_AT_TIMEOUT_MS) ||
         strstr(resp, "OK") == NULL) {
         ESP_LOGE(TAG, "AT+CGNSSPWR=1 failed: %s", resp);
         return false;
@@ -344,47 +254,83 @@ bool gnss_get_last_fix(gnss_fix_t *out) {
     return out->valid;
 }
 
-static void gnss_task(void *pvParameters) {
-    char resp[GNSS_AT_BUF_SIZE];
+/**
+ * Discipline the ESP32's system clock from a GNSS fix's own UTC date/time,
+ * so units with no WiFi (hence no SNTP - see init_sntp() in main.c) still
+ * get a correct wall clock, and any unit gets one faster/more reliably than
+ * waiting on SNTP at all. Called from gnss_poll_now() whenever a fix
+ * carries a parsed fix_time.
+ *
+ * Sanity-checks the date first (same tm_year idiom init_sntp() already uses
+ * to detect an unsynced clock) rather than trusting a malformed
+ * AT+CGNSSINFO date field outright - settimeofday() with garbage would be
+ * worse than not syncing at all. Skips the actual settimeofday() call (and
+ * its log line) once the clock is already within
+ * GNSS_CLOCK_SYNC_THRESHOLD_SEC of GPS time, so a clock that's already
+ * accurate (e.g. via SNTP) isn't needlessly nudged every report cycle.
+ */
+static void gnss_maybe_sync_system_clock(time_t gps_time) {
+    struct tm tm_utc;
+    if (gmtime_r(&gps_time, &tm_utc) == NULL || tm_utc.tm_year + 1900 < 2024) {
+        ESP_LOGW(TAG, "GNSS: implausible fix date, not syncing system clock");
+        return;
+    }
 
-    while (1) {
-        int n = gnss_send_at("AT+CGNSSINFO", resp, sizeof(resp), GNSS_AT_TIMEOUT_MS);
-        if (n > 0) {
-            // Read the current fix (preserves last-known position/valid flag
-            // across polls that don't have a fix - see gnss_parse_cgnssinfo).
-            gnss_fix_t fix;
-            taskENTER_CRITICAL(&s_fix_lock);
-            fix = s_last_fix;
-            taskEXIT_CRITICAL(&s_fix_lock);
+    time_t now = time(NULL);
+    long delta = (long)(gps_time - now);
+    if (labs(delta) < GNSS_CLOCK_SYNC_THRESHOLD_SEC) {
+        return;
+    }
 
-            if (gnss_parse_cgnssinfo(resp, &fix)) {
-                gnss_update_fix(&fix);
-
-                if (fix.has_fix) {
-                    char time_buf[24] = "?";
-                    struct tm tm_utc;
-                    if (fix.fix_time > 0 && gmtime_r(&fix.fix_time, &tm_utc) != NULL) {
-                        strftime(time_buf, sizeof(time_buf), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
-                    }
-                    ESP_LOGI(TAG, "GNSS fix: lat=%.6f lon=%.6f alt=%.1fm sats=%d time=%s",
-                              fix.latitude, fix.longitude, fix.altitude_m,
-                              fix.num_satellites, time_buf);
-                } else {
-                    ESP_LOGI(TAG, "GNSS: no fix yet");
-                }
-            } else {
-                ESP_LOGW(TAG, "GNSS: unexpected CGNSSINFO response: %s", resp);
-            }
-        } else {
-            ESP_LOGW(TAG, "GNSS: AT+CGNSSINFO timed out");
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(GNSS_POLL_INTERVAL_SEC * 1000));
+    struct timeval tv = { .tv_sec = gps_time, .tv_usec = 0 };
+    if (settimeofday(&tv, NULL) == 0) {
+        ESP_LOGI(TAG, "System clock synced from GPS (was off by %lds)", delta);
+    } else {
+        ESP_LOGW(TAG, "settimeofday() from GPS fix failed");
     }
 }
 
-void gnss_start_task(void) {
-    xTaskCreate(gnss_task, "gnss_task", 4096, NULL, 3, NULL);
+bool gnss_poll_now(void) {
+    char resp[GNSS_AT_BUF_SIZE];
+
+    bool got = modem_uart_send_at("AT+CGNSSINFO", resp, sizeof(resp), GNSS_AT_TIMEOUT_MS);
+    if (!got) {
+        ESP_LOGW(TAG, "GNSS: AT+CGNSSINFO timed out");
+        return false;
+    }
+
+    // Read the current fix (preserves last-known position/valid flag
+    // across polls that don't have a fix - see gnss_parse_cgnssinfo).
+    gnss_fix_t fix;
+    taskENTER_CRITICAL(&s_fix_lock);
+    fix = s_last_fix;
+    taskEXIT_CRITICAL(&s_fix_lock);
+
+    if (!gnss_parse_cgnssinfo(resp, &fix)) {
+        ESP_LOGW(TAG, "GNSS: unexpected CGNSSINFO response: %s", resp);
+        return false;
+    }
+
+    gnss_update_fix(&fix);
+
+    if (fix.has_fix) {
+        char time_buf[24] = "?";
+        struct tm tm_utc;
+        if (fix.fix_time > 0 && gmtime_r(&fix.fix_time, &tm_utc) != NULL) {
+            strftime(time_buf, sizeof(time_buf), "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+        }
+        ESP_LOGI(TAG, "GNSS fix: lat=%.6f lon=%.6f alt=%.1fm sats=%d time=%s",
+                  fix.latitude, fix.longitude, fix.altitude_m,
+                  fix.num_satellites, time_buf);
+
+        if (fix.fix_time > 0) {
+            gnss_maybe_sync_system_clock(fix.fix_time);
+        }
+    } else {
+        ESP_LOGI(TAG, "GNSS: no fix yet");
+    }
+
+    return true;
 }
 
 #endif // ESP_PLATFORM

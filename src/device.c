@@ -406,21 +406,34 @@ int device_cleanup(device_list_t *list, int max_age_sec) {
     return removed;
 }
 
+/**
+ * Should this device count toward device_get_summary()/
+ * device_get_distance_summary()'s totals? Shared by both so their filtering
+ * can't drift apart - see device_get_summary()'s doc comment in device.h
+ * for what each check excludes.
+ */
+static bool device_counts_toward_summary(const ble_device_t *dev) {
+    if (!dev->active) {
+        return false;
+    }
+    if (dev->has_superseded_by) {
+        return false;  // MAC-rotated ghost, already counted under its newer MAC
+    }
+    if (dev->seen_count < DEVICE_MIN_SEEN_COUNT_FOR_SUMMARY) {
+        return false;  // one-off blip, not enough evidence of a real device yet
+    }
+    if (dev->raw_rssi < MIN_RSSI_FOR_SUMMARY) {
+        return false;  // signal too weak to trust - risk of a misdecoded MAC
+    }
+    return true;
+}
+
 void device_get_summary(const device_list_t *list, device_summary_t *summary) {
     memset(summary, 0, sizeof(device_summary_t));
-    
+
     for (int i = 0; i < MAX_DEVICES; i++) {
-        if (!list->devices[i].active) {
+        if (!device_counts_toward_summary(&list->devices[i])) {
             continue;
-        }
-        if (list->devices[i].has_superseded_by) {
-            continue;  // MAC-rotated ghost, already counted under its newer MAC
-        }
-        if (list->devices[i].seen_count < DEVICE_MIN_SEEN_COUNT_FOR_SUMMARY) {
-            continue;  // one-off blip, not enough evidence of a real device yet
-        }
-        if (list->devices[i].raw_rssi < MIN_RSSI_FOR_SUMMARY) {
-            continue;  // signal too weak to trust - risk of a misdecoded MAC
         }
 
         summary->total_devices++;
@@ -453,6 +466,46 @@ void device_get_summary(const device_list_t *list, device_summary_t *summary) {
             default:
                 summary->other++;
                 break;
+        }
+    }
+}
+
+/**
+ * The distance_breakdown_t field of `summary` corresponding to `category` -
+ * mirrors device_get_summary()'s switch exactly (same "other" catch-all for
+ * any category without its own field), so the two stay in sync.
+ */
+static distance_breakdown_t *distance_bucket_for_category(device_distance_summary_t *summary,
+                                                            device_category_t category) {
+    switch (category) {
+        case CATEGORY_PHONE:      return &summary->phones;
+        case CATEGORY_COMPUTER:   return &summary->computers;
+        case CATEGORY_WEARABLE:   return &summary->wearables;
+        case CATEGORY_TABLET:     return &summary->tablets;
+        case CATEGORY_BEACON:     return &summary->beacons;
+        case CATEGORY_WATCH:      return &summary->watches;
+        case CATEGORY_HEADPHONES: return &summary->headphones;
+        case CATEGORY_SPEAKER:    return &summary->speakers;
+        default:                  return &summary->other;
+    }
+}
+
+void device_get_distance_summary(const device_list_t *list, device_distance_summary_t *summary) {
+    memset(summary, 0, sizeof(device_distance_summary_t));
+
+    for (int i = 0; i < MAX_DEVICES; i++) {
+        const ble_device_t *dev = &list->devices[i];
+        if (!device_counts_toward_summary(dev)) {
+            continue;
+        }
+
+        distance_breakdown_t *bucket = distance_bucket_for_category(summary, dev->category);
+        if (dev->distance < DISTANCE_BUCKET_NEAR_M) {
+            bucket->near++;
+        } else if (dev->distance < DISTANCE_BUCKET_MID_M) {
+            bucket->mid++;
+        } else {
+            bucket->far++;
         }
     }
 }

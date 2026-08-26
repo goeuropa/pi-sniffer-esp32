@@ -16,12 +16,111 @@
 #define WIFI_MAX_RETRY      10
 
 // ============================================================================
+// Legacy REST reporting - superseded by MQTT reporting below (see
+// plans/4g-integration.md). Left in place (http_client.c) rather than
+// deleted, but report_task() no longer calls it.
 #define API_URL             "https://3334.xomnghien.com/api/devices"
 #define API_TIMEOUT_MS      10000
 // Skip SSL certificate verification (e.g. for self-signed certs)
 #define API_SKIP_CERT_CHECK 1
 // Disable sending device data to the API (set to 1 to disable, 0 to enable)
-#define DISABLE_API_SEND    1
+#define DISABLE_API_SEND    0
+
+// ============================================================================
+// MQTT Reporting Configuration
+// ============================================================================
+// Which transport report_task() publishes device reports over, selected per
+// deployment - some units have WiFi, some are permanently off-grid on
+// cellular only. WiFi and cellular are mutually exclusive: run_normal_mode()
+// only starts the one background task (mqtt_report_task or cellular_task)
+// this setting actually needs, never both (see plans/4g-integration.md's
+// "Resolved decisions").
+typedef enum {
+    REPORT_TRANSPORT_WIFI_ONLY,
+    REPORT_TRANSPORT_CELLULAR_ONLY,
+} report_transport_t;
+
+#define REPORT_TRANSPORT           REPORT_TRANSPORT_CELLULAR_ONLY
+
+// MQTT broker - both the WiFi path (esp-mqtt, needs a full URI) and the
+// cellular path (AT+CMQTTCONNECT, needs host/port split out) connect here.
+// Publicly reachable hostname (not a LAN-only address) - needed for the
+// cellular path, which isn't on the same network as a local broker would
+// be. Plain (unencrypted) MQTT on the standard port for now; TLS/auth is
+// still an open question, see plans/4g-integration.md.
+// Full publish topic is "<prefix>/<device_id>" - one topic per unit, same
+// JSON body device_json_build() produces today regardless of transport.
+#define MQTT_TOPIC_PREFIX           "reports"
+#define MQTT_QOS                    1
+#define MQTT_KEEPALIVE_SEC          60
+
+// How often mqtt_report_task's outer loop re-kicks wifi_connect() once
+// wifi_manager.c's own fast burst-retry (WIFI_MAX_RETRY, back-to-back) has
+// already given up. A brief WiFi blip still recovers in seconds via that
+// existing fast retry, unchanged - this is only the paced fallback for a
+// genuinely down AP/outage, so the device doesn't sit permanently stuck the
+// way it could before (wifi_manager.c never retried again on its own).
+#define WIFI_RECONNECT_INTERVAL_SEC 300
+
+// ============================================================================
+// Cellular Configuration (SIM7670G modem-side AT+CMQTT*)
+// ============================================================================
+// Enable the cellular MQTT transport (cellular.c). Independent of
+// ENABLE_GNSS - both share the modem's UART via modem_uart.h - but there's
+// no point bringing up the modem's data connection on boards/deployments
+// that only need WiFi.
+#define ENABLE_CELLULAR              1
+
+// Deployment SIM: T-Mobile US MVNO block (MCC 310 / MNC 240), no PDP
+// username/password required.
+#define CELLULAR_APN                 "mnet"
+
+#define CELLULAR_AT_TIMEOUT_MS       10000
+#define CELLULAR_MQTT_CLIENT_INDEX   0
+
+// AT+CMQTTSTART's documented max response time is 12000ms per the
+// SIM7672X/SIM7652X MQTT(S) Application Note (the closest board-specific
+// reference found - hosted on Waveshare's own wiki page for this board).
+// An earlier version of this comment cited 120000ms from the older
+// SIM7500/7600/7800 MQTT AT command manual, which isn't specific to this
+// chip - corrected. Still longer than CELLULAR_AT_TIMEOUT_MS since it can
+// activate the PDP context on a cold/weak-signal attach.
+#define CELLULAR_CMQTTSTART_TIMEOUT_MS 12000
+
+// Outer-loop reconnect pacing, matching WIFI_RECONNECT_INTERVAL_SEC - cellular
+// has no independent fast-retry layer the way WiFi's event handler provides
+// (nothing signals a drop between publish attempts), so this is the only
+// reconnect pacing cellular_task has.
+#define CELLULAR_RECONNECT_BACKOFF_SEC 300
+
+// Conservative placeholder cap on a single AT+CMQTTPAYLOAD - the modem's
+// actual documented/firmware limit hasn't been confirmed on this board yet.
+// See "Data usage considerations" in plans/4g-integration.md - a full
+// MAX_DEVICES report can be tens of KB, likely needing payload
+// shrinking/compression for cellular-connected units well before this cap
+// is the binding constraint.
+#define CELLULAR_MQTT_MAX_PAYLOAD_LEN 4096
+
+// Skip a cellular send when nothing meaningful changed since the last one
+// actually sent - phone count identical and position (gnss_fix_t.latitude/
+// longitude, the *raw* unrounded floats, not the ~11m-rounded values that
+// go into the payload - see device_json_build_minimal()) moved less than
+// CELLULAR_POSITION_UNCHANGED_THRESHOLD_M - to cut needless AT+CMQTT*
+// traffic (and SIM data) for a stationary, steady-count unit. Still forces
+// a send at least every CELLULAR_HEARTBEAT_INTERVAL_SEC regardless, so a
+// unit that never moves/changes still proves it's alive on a predictable
+// cadence rather than going silent indefinitely. WiFi reporting is
+// unaffected - see cellular_should_send() in cellular.c.
+//
+// 5m (the original value) turned out to be inside the SIM7670G's own
+// stationary GNSS noise floor - confirmed on hardware: consecutive sends
+// with *identical* rounded lat/lon (e.g. two reports both showing
+// 47.5853,-122.0644 a few minutes apart) still triggered a send, meaning
+// the raw fix wandered past 5m and back within the same ~11m rounding
+// bucket purely from receiver jitter, not real movement. Raised well above
+// that noise floor so it only fires on an actual position change.
+#define CELLULAR_POSITION_UNCHANGED_THRESHOLD_M 20.0f
+#define CELLULAR_HEARTBEAT_INTERVAL_SEC          3600
 
 // ============================================================================
 // BLE Scanning Configuration
@@ -56,7 +155,7 @@
 // low-confidence chain of single-packet sightings that inflates the phone
 // count. Still shown in the per-device log listing either way, just
 // excluded from the category counts.
-#define MIN_RSSI_FOR_SUMMARY -100
+#define MIN_RSSI_FOR_SUMMARY -105
 
 // ============================================================================
 // RSSI to Distance Configuration
@@ -72,6 +171,13 @@
 
 // Maximum reasonable distance in meters (cap unrealistic values)
 #define MAX_DISTANCE_METERS     50.0f
+
+// Distance-bucket boundaries (meters) for the per-category breakdown in
+// print_summary() (main.c) - see device_get_distance_summary() in device.c.
+// Buckets are [0, DISTANCE_BUCKET_NEAR_M), [DISTANCE_BUCKET_NEAR_M,
+// DISTANCE_BUCKET_MID_M), [DISTANCE_BUCKET_MID_M, +inf).
+#define DISTANCE_BUCKET_NEAR_M   5.0f
+#define DISTANCE_BUCKET_MID_M    10.0f
 
 // ============================================================================
 // Device Identification
@@ -133,6 +239,12 @@
 // fix (lat/long/height/time) on a regular interval.
 #define ENABLE_GNSS              1
 
+// gnss_poll_now() is called exactly once per report cycle, synchronously,
+// from report_task() (main.c) - there's no independent GNSS polling task,
+// so this happens on report_task's own thread, once every
+// REPORT_INTERVAL_SEC, whichever transport (WiFi or cellular) is actually
+// configured to send.
+
 // UART peripheral and pins used to talk to the modem's AT command port.
 // Board docs give GPIO17/18 for this link but swapped from our original
 // guess: GPIO18 is the ESP32-S3's TX (into the modem's RX), GPIO17 is the
@@ -155,16 +267,22 @@
 #define GNSS_AT_SYNC_ATTEMPTS    20
 #define GNSS_AT_SYNC_RETRY_MS    2000
 
-// How often to poll AT+CGNSSINFO and log the result (seconds).
-#define GNSS_POLL_INTERVAL_SEC   30
+// Discipline the ESP32's system clock (settimeofday()) from each GNSS fix's
+// own UTC date/time, so units with no WiFi/SNTP still get a correct wall
+// clock - see gnss_poll_now()'s system-clock-sync step. Skip the actual
+// settimeofday() call (and its log line) if the system clock is already
+// within this many seconds of the GPS time, so a clock already kept
+// accurate (e.g. by SNTP) isn't needlessly nudged every report cycle.
+#define GNSS_CLOCK_SYNC_THRESHOLD_SEC 2
 
 // ============================================================================
 // Debugging
 // ============================================================================
-// Enable verbose logging
-#define DEBUG_LOGGING           1
-
-// Log individual device discoveries
+// Log individual device discoveries - the per-packet "Device: ..." line in
+// on_device_discovered() (main.c). Off by default: at any real device
+// density this is by far the noisiest log source, one line per BLE
+// advertisement seen. Independent of ble_scanner.c's own (lower-level, less
+// detailed) discovery line, which this same flag also gates.
 #define DEBUG_DEVICE_DISCOVERY  0
 
 // Append each device's per-Continuity-type stream windows (see

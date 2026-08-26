@@ -3,6 +3,22 @@
  *
  * Polls the SIM7670G's GNSS receiver over UART via AT commands
  * (AT+CGNSSPWR, AT+CGNSSINFO) and keeps track of the most recent fix.
+ * Also disciplines the ESP32's system clock (settimeofday()) from each
+ * fix's own UTC date/time - see gnss_poll_now() - so units with no WiFi
+ * (hence no SNTP) still get a correct wall clock.
+ *
+ * Deliberately has no independent polling task/timer - gnss_poll_now()
+ * must be called explicitly by whoever needs a fresh fix. It shares the
+ * modem's single AT command port with cellular.c (see modem_uart.h); the
+ * sole caller is report_task() (main.c), once per report cycle,
+ * unconditionally (whenever ENABLE_GNSS=1) regardless of which transport
+ * (WiFi or cellular) is actually configured to send - keeping GNSS and
+ * cellular AT-command activity to one call site apiece rather than
+ * interleaved on independent schedules (an earlier independent GNSS timer
+ * caused exactly that during hardware testing - see
+ * plans/4g-integration.md). cellular_task itself never touches GNSS: it
+ * receives whatever fix report_task already polled, passed through
+ * cellular_publish().
  */
 
 #ifndef GNSS_H
@@ -33,10 +49,17 @@ typedef struct {
 bool gnss_init(void);
 
 /**
- * Start the background task that polls AT+CGNSSINFO on
- * GNSS_POLL_INTERVAL_SEC and logs the result.
+ * Poll AT+CGNSSINFO once, synchronously, updating the cached fix
+ * (gnss_get_last_fix()) and logging the result. Call this explicitly right
+ * before you need a fresh fix - there's no background task doing this on a
+ * timer (see this header's top comment for why). Also disciplines the
+ * system clock from the fix's UTC date/time when one comes back valid and
+ * plausible - see gnss_maybe_sync_system_clock() in gnss.c.
+ * @return true if the AT+CGNSSINFO exchange itself completed (regardless of
+ *         whether it reported an actual fix - check gnss_get_last_fix()
+ *         separately for that)
  */
-void gnss_start_task(void);
+bool gnss_poll_now(void);
 
 /**
  * Copy out the most recently polled fix.

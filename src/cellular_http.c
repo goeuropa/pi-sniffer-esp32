@@ -161,8 +161,17 @@ static bool cellular_http_do_post(const char *json_body) {
         ok = false;
     }
 
+    // Best-effort, not fatal: confirmed on hardware that this SIM7670G
+    // firmware rejects AT+HTTPPARA="CID",1 with a plain ERROR even though
+    // PDP context 1 is already defined and active (AT+CGDCONT/AT+CGACT
+    // above both succeeded) - this module variant's HTTP service appears to
+    // just bind to whichever PDP context is already up rather than
+    // supporting an explicit CID selector, unlike what SIMCom's general
+    // HTTP(S) application note documents. Warn and continue rather than
+    // aborting the whole sequence over an optional selector that isn't
+    // needed when there's only one context anyway.
     if (ok && !cellular_http_at_locked("AT+HTTPPARA=\"CID\",1", resp, sizeof(resp), CELLULAR_AT_TIMEOUT_MS)) {
-        ok = false;
+        ESP_LOGW(TAG, "AT+HTTPPARA=\"CID\",1 failed (not supported on this firmware?) - continuing anyway");
     }
 
 #if API_SKIP_CERT_CHECK

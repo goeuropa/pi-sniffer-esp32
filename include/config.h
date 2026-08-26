@@ -6,6 +6,13 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
+// Deployment-specific network endpoints (API_URL, MQTT_BROKER_*,
+// CELLULAR_APN) live in secrets.h, which is gitignored - not checked into
+// source control. If this doesn't compile because secrets.h is missing,
+// copy include/secrets.h.example to include/secrets.h and fill in your own
+// values.
+#include "secrets.h"
+
 // ============================================================================
 // WiFi Configuration
 // ============================================================================
@@ -44,6 +51,9 @@ typedef enum {
 // cellular path, which isn't on the same network as a local broker would
 // be. Plain (unencrypted) MQTT on the standard port for now; TLS/auth is
 // still an open question, see plans/4g-integration.md.
+// MQTT_BROKER_HOST/PORT/URI are defined in secrets.h (gitignored) - see
+// this file's top comment.
+
 // Full publish topic is "<prefix>/<device_id>" - one topic per unit, same
 // JSON body device_json_build() produces today regardless of transport.
 #define MQTT_TOPIC_PREFIX           "reports"
@@ -67,9 +77,8 @@ typedef enum {
 // that only need WiFi.
 #define ENABLE_CELLULAR              1
 
-// Deployment SIM: T-Mobile US MVNO block (MCC 310 / MNC 240), no PDP
-// username/password required.
-#define CELLULAR_APN                 "mnet"
+// CELLULAR_APN is defined in secrets.h (gitignored) - see this file's top
+// comment. No PDP username/password required for this deployment's SIM.
 
 #define CELLULAR_AT_TIMEOUT_MS       10000
 #define CELLULAR_MQTT_CLIENT_INDEX   0
@@ -122,15 +131,24 @@ typedef enum {
 // Cellular HTTP reporting (SIM7670G modem-side AT+HTTP*, cellular_http.c) -
 // alternative to REPORT_TRANSPORT_CELLULAR_MQTT (MQTT) above for the same
 // metered SIM. POSTs the legacy full-device JSON (device_json_build(), see
-// device_json.h) to API_URL/API_TIMEOUT_MS/API_SKIP_CERT_CHECK from the
-// legacy REST block above - reused as-is rather than duplicated under a
-// CELLULAR_HTTP_* prefix, since this transport's whole point is hitting
-// that same old endpoint/format, just over cellular instead of WiFi.
-// Throttled by the same CELLULAR_POSITION_UNCHANGED_THRESHOLD_M/
-// CELLULAR_HEARTBEAT_INTERVAL_SEC above (see report_throttle.h) - the
-// legacy payload is much larger than cellular MQTT's minimal one, so
-// sending it unconditionally every REPORT_INTERVAL_SEC isn't viable on a
-// metered plan.
+// device_json.h) to API_URL (defined in secrets.h, gitignored - see this
+// file's top comment), using the modem's own AT+HTTP* command set instead
+// of esp_http_client (which needs a PPP/TCP-IP stack this project
+// deliberately doesn't bring up over cellular - see
+// plans/4g-integration.md's transport decision). API_URL/API_TIMEOUT_MS are
+// also still referenced by http_client.c's now-unused WiFi/esp_http_client
+// path (http_send_devices(), no longer called by report_task()) - kept as
+// one shared endpoint/timeout rather than duplicated, since both are
+// posting the same JSON shape to the same place. Throttled by the same
+// CELLULAR_POSITION_UNCHANGED_THRESHOLD_M/CELLULAR_HEARTBEAT_INTERVAL_SEC
+// above (see report_throttle.h) - the legacy payload is much larger than
+// cellular MQTT's minimal one, so sending it unconditionally every
+// REPORT_INTERVAL_SEC isn't viable on a metered plan.
+#define API_TIMEOUT_MS      10000
+// Skip SSL certificate verification (e.g. for self-signed certs) - honored
+// by cellular_http.c (AT+CSSLCFG); http_client.c's dead WiFi path always
+// verifies via esp_crt_bundle_attach and ignores this.
+#define API_SKIP_CERT_CHECK 1
 
 // AT+HTTPACTION's result arrives later as an unsolicited "+HTTPACTION" URC,
 // not synchronously with the command's own OK - this bounds how long

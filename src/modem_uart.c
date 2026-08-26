@@ -73,7 +73,7 @@ int modem_uart_read_response(char *resp, size_t resp_size, int timeout_ms) {
     return (int)total;
 }
 
-bool modem_uart_wait_for_prompt(char *resp, size_t resp_size, int timeout_ms) {
+bool modem_uart_wait_for_token(char *resp, size_t resp_size, int timeout_ms, const char *token) {
     size_t total = 0;
     TickType_t start = xTaskGetTickCount();
     TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
@@ -84,7 +84,7 @@ bool modem_uart_wait_for_prompt(char *resp, size_t resp_size, int timeout_ms) {
         if (n > 0) {
             total += n;
             resp[total] = '\0';
-            if (strchr(resp, '>') != NULL) {
+            if (strstr(resp, token) != NULL) {
                 ESP_LOGI(TAG, "AT RX: %s", resp);
                 return true;
             }
@@ -95,7 +95,37 @@ bool modem_uart_wait_for_prompt(char *resp, size_t resp_size, int timeout_ms) {
         }
     }
     resp[total] = '\0';
-    ESP_LOGI(TAG, "AT RX: %s", total > 0 ? resp : "(no response, no '>' prompt)");
+    ESP_LOGI(TAG, "AT RX: %s", total > 0 ? resp : "(no response, no matching token)");
+    return false;
+}
+
+bool modem_uart_wait_for_prompt(char *resp, size_t resp_size, int timeout_ms) {
+    return modem_uart_wait_for_token(resp, resp_size, timeout_ms, ">");
+}
+
+bool modem_uart_wait_for_urc(char *resp, size_t resp_size, int timeout_ms, const char *urc_prefix) {
+    size_t total = 0;
+    TickType_t start = xTaskGetTickCount();
+    TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+
+    // Unlike modem_uart_wait_for_token(), an "OK" or even an "ERROR" seen
+    // along the way doesn't end the wait - AT+HTTPACTION's own OK arrives
+    // long before the URC that actually matters does, and isn't a reason to
+    // give up. Only the URC prefix itself, or the timeout, ends this.
+    while ((xTaskGetTickCount() - start) < timeout_ticks && total < resp_size - 1) {
+        int n = uart_read_bytes(GNSS_UART_NUM, (uint8_t *)resp + total,
+                                 resp_size - 1 - total, pdMS_TO_TICKS(200));
+        if (n > 0) {
+            total += n;
+            resp[total] = '\0';
+            if (strstr(resp, urc_prefix) != NULL) {
+                ESP_LOGI(TAG, "AT RX: %s", resp);
+                return true;
+            }
+        }
+    }
+    resp[total] = '\0';
+    ESP_LOGI(TAG, "AT RX: %s", total > 0 ? resp : "(no response, no matching URC)");
     return false;
 }
 

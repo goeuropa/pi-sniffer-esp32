@@ -22,7 +22,7 @@ app described below.
 
 Current `config.h` is set to test cellular reporting specifically:
 `DISABLE_API_SEND=0`, `ENABLE_CELLULAR=1`, `REPORT_TRANSPORT=
-REPORT_TRANSPORT_CELLULAR_ONLY` (WiFi still connects for provisioning/SNTP,
+REPORT_TRANSPORT_CELLULAR_MQTT` (WiFi still connects for provisioning/SNTP,
 just isn't used for reporting), `MQTT_BROKER_HOST=api.mercerfamily.org:1883`
 (publicly reachable, needed since the cellular link isn't on the same
 network as a LAN-only broker would be).

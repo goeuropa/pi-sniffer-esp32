@@ -29,12 +29,18 @@
  * only GNSS poll site in the firmware - see gnss.h.
  *
  * Not every queued report is actually sent over the air: cellular_task's
- * cellular_should_send() skips a send when the position hasn't moved more
- * than CELLULAR_POSITION_UNCHANGED_THRESHOLD_M and the phone count hasn't
- * changed since the last report actually sent - but never skips more than
- * CELLULAR_HEARTBEAT_INTERVAL_SEC in a row, so a stationary unit still
- * checks in hourly. Cuts needless AT+CMQTT* traffic/SIM data; WiFi
- * reporting (mqtt_report.c) is unaffected.
+ * report_throttle_should_send() (report_throttle.h) skips a send when the
+ * position hasn't moved more than CELLULAR_POSITION_UNCHANGED_THRESHOLD_M
+ * and the phone count hasn't changed since the last report actually sent -
+ * but never skips more than CELLULAR_HEARTBEAT_INTERVAL_SEC in a row, so a
+ * stationary unit still checks in hourly. Cuts needless AT+CMQTT*
+ * traffic/SIM data; WiFi reporting (mqtt_report.c) is unaffected.
+ *
+ * cellular_pdp_ensure_up() (PDP bring-up only, no MQTT) is also exposed for
+ * cellular_http.c (REPORT_TRANSPORT_CELLULAR_HTTP) to reuse - the two
+ * transports are mutually exclusive at runtime, so there's no bring-up race
+ * between them, just a shared "define+activate the PDP context" step
+ * neither needs to duplicate.
  */
 
 #ifndef CELLULAR_H
@@ -72,8 +78,9 @@ bool cellular_is_connected(void);
  * Hand off a report to be published over the modem's AT+CMQTT* MQTT session.
  * Returns as soon as the report is queued - the connect/reconnect (subject
  * to CELLULAR_RECONNECT_BACKOFF_SEC), the should-send decision
- * (cellular_should_send()), payload build, and AT+CMQTTTOPIC/PAYLOAD/PUB
- * exchange all happen later, asynchronously, on cellular_task. If a report
+ * (report_throttle_should_send(), report_throttle.h), payload build, and
+ * AT+CMQTTTOPIC/PAYLOAD/PUB exchange all happen later, asynchronously, on
+ * cellular_task. If a report
  * is already queued and not yet sent, it's replaced by this one - only the
  * most recent report is ever attempted, never a backlog.
  * @param phone_count Current phone count (device_summary_t.phones) - the
@@ -86,5 +93,25 @@ bool cellular_is_connected(void);
  *         delivery success/failure is logged separately, from cellular_task
  */
 bool cellular_publish(const char *topic, int phone_count, gnss_fix_t fix, int qos);
+
+/**
+ * Define and activate the PDP context against CELLULAR_APN (AT+CGDCONT +
+ * AT+CGACT), if not already up. Idempotent/cheap to call every cycle once
+ * up. Shared by cellular_task internally and by cellular_http.c
+ * (REPORT_TRANSPORT_CELLULAR_HTTP) - the MQTT-specific bring-up
+ * (AT+CMQTTSTART/ACCQ/CONNECT) stays private to this file, only the PDP
+ * layer underneath it is exposed.
+ * @return true once the PDP context is up (was already up, or just brought
+ *         up successfully); false if not yet registered on the network
+ *         (AT+CEREG?) or a bring-up AT command failed
+ */
+bool cellular_pdp_ensure_up(void);
+
+/**
+ * Passive read of whether the PDP context is currently up - unlike
+ * cellular_pdp_ensure_up(), never attempts to bring it up. For status/log
+ * lines only (e.g. cellular_http_is_connected()).
+ */
+bool cellular_pdp_is_up(void);
 
 #endif // CELLULAR_H

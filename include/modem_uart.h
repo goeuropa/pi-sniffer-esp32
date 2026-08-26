@@ -67,14 +67,41 @@ void modem_uart_write_raw(const void *buf, size_t len);
 int modem_uart_read_response(char *resp, size_t resp_size, int timeout_ms);
 
 /**
+ * Read bytes until the given token substring is seen, "ERROR" is seen, or
+ * the timeout elapses - the general form of modem_uart_wait_for_prompt()
+ * below, for AT commands whose "ready for a raw-data argument" signal isn't
+ * a bare ">" (e.g. AT+HTTPDATA, which SIMCom's HTTP(S) AT command manual
+ * documents as sending "DOWNLOAD" instead - see cellular_http.c). Caller
+ * must hold the UART lock (modem_uart_lock()).
+ * @return true if token was seen, false on ERROR or timeout
+ */
+bool modem_uart_wait_for_token(char *resp, size_t resp_size, int timeout_ms, const char *token);
+
+/**
  * Read bytes until a ">" prompt byte is seen (the modem signaling it's
  * ready for a raw-data argument - AT+CMQTTTOPIC/AT+CMQTTPAYLOAD both work
  * this way per SIMCom's MQTT AT command manual: command line, wait for ">",
  * then the raw data, then OK), "ERROR" is seen, or the timeout elapses.
- * Caller must hold the UART lock (modem_uart_lock()).
+ * Caller must hold the UART lock (modem_uart_lock()). Thin wrapper around
+ * modem_uart_wait_for_token(resp, resp_size, timeout_ms, ">").
  * @return true if the prompt was seen, false on ERROR or timeout
  */
 bool modem_uart_wait_for_prompt(char *resp, size_t resp_size, int timeout_ms);
+
+/**
+ * Keep reading past whatever's already come back (including an earlier
+ * "OK") until an unsolicited response starting with urc_prefix is seen, or
+ * the timeout elapses - for AT commands whose actual result arrives later,
+ * asynchronously, as a URC rather than inline with the command's own OK.
+ * AT+HTTPACTION is exactly this: it returns OK immediately, then
+ * "+HTTPACTION: <method>,<status>,<datalen>" arrives some time later once
+ * the HTTP request itself completes (see cellular_http.c). Caller must hold
+ * the UART lock (modem_uart_lock()) for the whole wait, same as any other
+ * multi-step exchange on this shared UART.
+ * @return true if a line starting with urc_prefix was seen, false on
+ *         timeout with no such line
+ */
+bool modem_uart_wait_for_urc(char *resp, size_t resp_size, int timeout_ms, const char *urc_prefix);
 
 /**
  * Discard any bytes currently sitting in the UART RX buffer. Useful before

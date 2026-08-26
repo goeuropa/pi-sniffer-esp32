@@ -15,6 +15,8 @@ idf_component_register(
         "gnss.c"
         "modem_uart.c"
         "cellular.c"
+        "cellular_http.c"
+        "report_throttle.c"
         "mqtt_report.c"
     INCLUDE_DIRS
         "."

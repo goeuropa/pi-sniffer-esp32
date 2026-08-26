@@ -9,8 +9,8 @@
 #include "modem_uart.h"
 #include "gnss.h"
 #include "device_json.h"
+#include "report_throttle.h"
 
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,17 +57,10 @@ static bool s_mqtt_connected = false;
 static time_t s_next_reconnect_attempt = 0;
 
 // State of the last report actually *sent* (not just queued/attempted) -
-// compared against each new cycle's fix/phone_count by cellular_should_send()
-// to decide whether this one is worth sending too. Mirrors exactly what
-// went into that last payload (device_json_build_minimal()'s fix.valid/
-// latitude/longitude), not just the raw GNSS state, so "unchanged" always
-// means "unchanged from what the server was last told".
-static bool s_last_sent_ever = false;
-static bool s_last_sent_position_valid = false;
-static float s_last_sent_lat = 0.0f;
-static float s_last_sent_lon = 0.0f;
-static int s_last_sent_phone_count = -1;
-static time_t s_last_sent_time = 0;
+// see report_throttle.h. Shared logic, but this instance is private to the
+// cellular-MQTT transport - cellular_http.c (mutually exclusive at runtime)
+// keeps its own.
+static report_throttle_state_t s_throttle;
 
 /**
  * AT+CEREG? - confirm the modem has actually joined the LTE network before
@@ -153,6 +146,14 @@ static bool cellular_bring_up_pdp(void) {
     ESP_LOGI(TAG, "PDP context defined and activated (APN=%s)", CELLULAR_APN);
     s_pdp_up = true;
     return true;
+}
+
+bool cellular_pdp_ensure_up(void) {
+    return cellular_bring_up_pdp();
+}
+
+bool cellular_pdp_is_up(void) {
+    return s_pdp_up;
 }
 
 /**
@@ -421,75 +422,16 @@ static void cellular_free_pending(cellular_pending_report_t *item) {
 }
 
 /**
- * Straight-line ground distance between two lat/lon points, in meters.
- * Equirectangular approximation (flat-earth, scaled by degrees-to-meters at
- * the mean latitude) rather than full haversine - plenty accurate at the
- * few-meters scale CELLULAR_POSITION_UNCHANGED_THRESHOLD_M cares about, and
- * cheap enough to call every cellular_task cycle.
- */
-static float cellular_distance_m(float lat1, float lon1, float lat2, float lon2) {
-    const float deg_to_rad = 0.017453293f; // pi / 180
-    const float m_per_deg_lat = 111320.0f; // ~constant; longitude scales by cos(lat)
-    float mean_lat_rad = (lat1 + lat2) * 0.5f * deg_to_rad;
-    float dlat_m = (lat2 - lat1) * m_per_deg_lat;
-    float dlon_m = (lon2 - lon1) * m_per_deg_lat * cosf(mean_lat_rad);
-    return sqrtf(dlat_m * dlat_m + dlon_m * dlon_m);
-}
-
-/**
- * Decide whether this cycle's fix/phone_count is worth a cellular send, per
- * CELLULAR_POSITION_UNCHANGED_THRESHOLD_M/CELLULAR_HEARTBEAT_INTERVAL_SEC
- * (config.h) - Ian's explicit direction to skip a send when nothing
- * meaningful changed since the last one actually went out, but never skip
- * more than an hour's worth in a row. Compares against s_last_sent_* (what
- * was last actually published), not the previous cycle's fix - a run of
- * cycles that are each individually unchanged from the one before, but
- * drift past the threshold cumulatively, still triggers a send.
- * Always sends: the very first report ever, whenever the phone count
- * differs, whenever "do we have a known position at all" flips (gained or
- * lost a fix since the last send), or whenever more than
- * CELLULAR_HEARTBEAT_INTERVAL_SEC has elapsed since the last send
- * regardless of anything else.
- */
-static bool cellular_should_send(const gnss_fix_t *fix, int phone_count) {
-    if (!s_last_sent_ever) {
-        return true;
-    }
-
-    if (time(NULL) - s_last_sent_time >= CELLULAR_HEARTBEAT_INTERVAL_SEC) {
-        return true;
-    }
-
-    if (phone_count != s_last_sent_phone_count) {
-        return true;
-    }
-
-    if (fix->valid != s_last_sent_position_valid) {
-        return true; // gained or lost a known position since the last send
-    }
-
-    if (fix->valid) {
-        float moved_m = cellular_distance_m(s_last_sent_lat, s_last_sent_lon,
-                                             fix->latitude, fix->longitude);
-        if (moved_m > CELLULAR_POSITION_UNCHANGED_THRESHOLD_M) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-/**
  * Background task: blocks on the report queue (zero CPU while idle). Each
  * time a report arrives:
  *   1. cellular_ensure_connected() - paced by CELLULAR_RECONNECT_BACKOFF_SEC
  *      internally, so calling it every cycle (~every REPORT_INTERVAL_SEC)
  *      costs nothing extra while backing off (returns fast, no AT traffic).
- *   2. If connected: cellular_should_send() decides whether item->fix/
- *      phone_count (already polled by report_task, once per report cycle -
- *      cellular_task itself never touches GNSS, see gnss.h) differ enough
- *      from the last one actually *sent* to be worth it (or enough time has
- *      passed - see config.h's
+ *   2. If connected: report_throttle_should_send() (report_throttle.h)
+ *      decides whether item->fix/phone_count (already polled by
+ *      report_task, once per report cycle - cellular_task itself never
+ *      touches GNSS, see gnss.h) differ enough from the last one actually
+ *      *sent* to be worth it (or enough time has passed - see config.h's
  *      CELLULAR_POSITION_UNCHANGED_THRESHOLD_M/CELLULAR_HEARTBEAT_INTERVAL_SEC).
  *      If so, build the payload (device_json_build_minimal(), from
  *      item->fix) and publish it. A failure here marks the session down
@@ -509,9 +451,9 @@ static void cellular_task(void *pvParameters) {
         }
 
         if (cellular_ensure_connected()) {
-            if (!cellular_should_send(&item->fix, item->phone_count)) {
+            if (!report_throttle_should_send(&s_throttle, &item->fix, item->phone_count)) {
                 ESP_LOGI(TAG, "Skipping cellular send: position/count unchanged (last sent %llds ago)",
-                         (long long)(time(NULL) - s_last_sent_time));
+                         (long long)(time(NULL) - s_throttle.last_sent_time));
             } else {
                 char *payload = device_json_build_minimal(item->fix.valid, item->fix.latitude, item->fix.longitude,
                                                             item->fix.fix_time, item->phone_count, s_client_id);
@@ -528,16 +470,11 @@ static void cellular_task(void *pvParameters) {
                 } else if (!cellular_do_publish(item->topic, payload, item->qos)) {
                     cellular_mark_disconnected();
                 } else {
-                    // Record what actually went out - cellular_should_send()
-                    // compares the *next* cycle's fix/phone_count against
-                    // this, not against whatever the previous cycle merely
-                    // considered.
-                    s_last_sent_ever = true;
-                    s_last_sent_time = time(NULL);
-                    s_last_sent_phone_count = item->phone_count;
-                    s_last_sent_position_valid = item->fix.valid;
-                    s_last_sent_lat = item->fix.latitude;
-                    s_last_sent_lon = item->fix.longitude;
+                    // Record what actually went out -
+                    // report_throttle_should_send() compares the *next*
+                    // cycle's fix/phone_count against this, not against
+                    // whatever the previous cycle merely considered.
+                    report_throttle_record_sent(&s_throttle, &item->fix, item->phone_count);
                 }
                 free(payload);
             }

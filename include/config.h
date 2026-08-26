@@ -16,31 +16,27 @@
 #define WIFI_MAX_RETRY      10
 
 // ============================================================================
-// Legacy REST reporting - superseded by MQTT reporting below (see
-// plans/4g-integration.md). Left in place (http_client.c) rather than
-// deleted, but report_task() no longer calls it.
-#define API_URL             "https://3334.xomnghien.com/api/devices"
-#define API_TIMEOUT_MS      10000
-// Skip SSL certificate verification (e.g. for self-signed certs)
-#define API_SKIP_CERT_CHECK 1
-// Disable sending device data to the API (set to 1 to disable, 0 to enable)
-#define DISABLE_API_SEND    0
-
-// ============================================================================
-// MQTT Reporting Configuration
+// Reporting Configuration
 // ============================================================================
 // Which transport report_task() publishes device reports over, selected per
 // deployment - some units have WiFi, some are permanently off-grid on
-// cellular only. WiFi and cellular are mutually exclusive: run_normal_mode()
-// only starts the one background task (mqtt_report_task or cellular_task)
-// this setting actually needs, never both (see plans/4g-integration.md's
-// "Resolved decisions").
+// cellular only. Exactly one of these ever runs: run_normal_mode() only
+// starts the one background task (mqtt_report_task, cellular_task, or
+// cellular_http_task) this setting actually needs, never more than one (see
+// plans/4g-integration.md's "Resolved decisions").
 typedef enum {
-    REPORT_TRANSPORT_WIFI_ONLY,
-    REPORT_TRANSPORT_CELLULAR_ONLY,
+    REPORT_TRANSPORT_WIFI,
+    REPORT_TRANSPORT_CELLULAR_MQTT,      // MQTT over cellular (AT+CMQTT*, cellular.c)
+    REPORT_TRANSPORT_CELLULAR_HTTP,      // HTTP POST over cellular (AT+HTTP*, cellular_http.c) -
+                                          // legacy full-device JSON format, see cellular_http.h
 } report_transport_t;
 
-#define REPORT_TRANSPORT           REPORT_TRANSPORT_CELLULAR_ONLY
+#define REPORT_TRANSPORT           REPORT_TRANSPORT_CELLULAR_HTTP
+
+// Disable sending device reports entirely (set to 1 to disable, 0 to
+// enable) - applies to whichever REPORT_TRANSPORT is selected above, not
+// just one transport.
+#define DISABLE_API_SEND    0
 
 // MQTT broker - both the WiFi path (esp-mqtt, needs a full URI) and the
 // cellular path (AT+CMQTTCONNECT, needs host/port split out) connect here.
@@ -110,7 +106,7 @@ typedef enum {
 // a send at least every CELLULAR_HEARTBEAT_INTERVAL_SEC regardless, so a
 // unit that never moves/changes still proves it's alive on a predictable
 // cadence rather than going silent indefinitely. WiFi reporting is
-// unaffected - see cellular_should_send() in cellular.c.
+// unaffected - see report_throttle_should_send() in report_throttle.c.
 //
 // 5m (the original value) turned out to be inside the SIM7670G's own
 // stationary GNSS noise floor - confirmed on hardware: consecutive sends
@@ -121,6 +117,28 @@ typedef enum {
 // that noise floor so it only fires on an actual position change.
 #define CELLULAR_POSITION_UNCHANGED_THRESHOLD_M 20.0f
 #define CELLULAR_HEARTBEAT_INTERVAL_SEC          3600
+
+// ----------------------------------------------------------------------
+// Cellular HTTP reporting (SIM7670G modem-side AT+HTTP*, cellular_http.c) -
+// alternative to REPORT_TRANSPORT_CELLULAR_MQTT (MQTT) above for the same
+// metered SIM. POSTs the legacy full-device JSON (device_json_build(), see
+// device_json.h) to API_URL/API_TIMEOUT_MS/API_SKIP_CERT_CHECK from the
+// legacy REST block above - reused as-is rather than duplicated under a
+// CELLULAR_HTTP_* prefix, since this transport's whole point is hitting
+// that same old endpoint/format, just over cellular instead of WiFi.
+// Throttled by the same CELLULAR_POSITION_UNCHANGED_THRESHOLD_M/
+// CELLULAR_HEARTBEAT_INTERVAL_SEC above (see report_throttle.h) - the
+// legacy payload is much larger than cellular MQTT's minimal one, so
+// sending it unconditionally every REPORT_INTERVAL_SEC isn't viable on a
+// metered plan.
+
+// AT+HTTPACTION's result arrives later as an unsolicited "+HTTPACTION" URC,
+// not synchronously with the command's own OK - this bounds how long
+// cellular_http_task waits for that URC before giving up. Needs on-device
+// verification, same as CELLULAR_CMQTTSTART_TIMEOUT_MS was - starting
+// conservative per SIMCom's HTTP(S) application note's documented worst case
+// (a slow far-end server/DNS lookup).
+#define CELLULAR_HTTP_ACTION_TIMEOUT_MS 120000
 
 // ============================================================================
 // BLE Scanning Configuration

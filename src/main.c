@@ -38,6 +38,7 @@
 #include "gnss.h"
 #include "mqtt_report.h"
 #include "cellular.h"
+#include "cellular_http.h"
 
 static const char *TAG = "BLE_SNIFFER";
 
@@ -396,12 +397,37 @@ static void report_task(void *pvParameters) {
             // touch device_list itself, just this already-computed count.
             device_summary_t summary;
             device_get_summary(&device_list, &summary);
+
+            // REPORT_TRANSPORT_CELLULAR_HTTP's payload (device_json_build(),
+            // the legacy full-device format) is the one exception that does
+            // need device_list itself, under this same lock - unlike the
+            // minimal payload above, it iterates every device. Only pay for
+            // that expensive build when cellular_http_should_send() (a
+            // cheap synchronous pre-check against the last report actually
+            // sent - see report_throttle.h) says this cycle is even a
+            // candidate to send; cellular_http_publish() re-checks
+            // authoritatively, with a fresher fix, right before actually
+            // sending - see cellular_http.h.
+            char *cellular_http_json_body = NULL;
+#if ENABLE_CELLULAR
+            if (REPORT_TRANSPORT == REPORT_TRANSPORT_CELLULAR_HTTP) {
+                gnss_fix_t fix_for_gate = {0};
+#if ENABLE_GNSS
+                gnss_get_last_fix(&fix_for_gate); // last-known fix is fine for this
+                                                   // gate - the fresh poll below is
+                                                   // what actually gets sent
 #endif
+                if (cellular_http_should_send(summary.phones, fix_for_gate)) {
+                    cellular_http_json_body = device_json_build(&device_list, device_id);
+                }
+            }
+#endif
+#endif // !DISABLE_API_SEND
 
             // Everything from here on works from independent snapshots
-            // (summary, and the GNSS fix below), not device_list itself -
-            // release the lock now rather than holding it through the GNSS
-            // poll/network queuing/logging.
+            // (summary, cellular_http_json_body, and the GNSS fix below),
+            // not device_list itself - release the lock now rather than
+            // holding it through the GNSS poll/network queuing/logging.
             xSemaphoreGive(device_list_mutex);
 
 #if !DISABLE_API_SEND
@@ -433,7 +459,7 @@ static void report_task(void *pvParameters) {
             bool cellular_queued = false;
 
             switch (REPORT_TRANSPORT) {
-                case REPORT_TRANSPORT_WIFI_ONLY:
+                case REPORT_TRANSPORT_WIFI:
                     if (mqtt_report_is_connected()) {
                         char *json_body = device_json_build_minimal(fix.valid, fix.latitude, fix.longitude,
                                                                       fix.fix_time, summary.phones, device_id);
@@ -444,11 +470,25 @@ static void report_task(void *pvParameters) {
                     }
                     break;
 
-                case REPORT_TRANSPORT_CELLULAR_ONLY:
+                case REPORT_TRANSPORT_CELLULAR_MQTT:
 #if ENABLE_CELLULAR
                     cellular_queued = cellular_publish(topic, summary.phones, fix, MQTT_QOS);
 #else
                     ESP_LOGW(TAG, "REPORT_TRANSPORT is cellular-only but ENABLE_CELLULAR=0");
+#endif
+                    break;
+
+                case REPORT_TRANSPORT_CELLULAR_HTTP:
+#if ENABLE_CELLULAR
+                    if (cellular_http_json_body != NULL) {
+                        cellular_queued = cellular_http_publish(topic, cellular_http_json_body,
+                                                                 summary.phones, fix);
+                        cellular_http_json_body = NULL; // ownership transferred either way
+                    } else {
+                        ESP_LOGI(TAG, "Skipping cellular HTTP report: throttled");
+                    }
+#else
+                    ESP_LOGW(TAG, "REPORT_TRANSPORT is cellular-HTTP but ENABLE_CELLULAR=0");
 #endif
                     break;
             }
@@ -463,14 +503,26 @@ static void report_task(void *pvParameters) {
                 // the transport in play - spell out both states here too
                 // rather than a generic "not sent" that leaves it
                 // ambiguous which transport (or both) was the problem.
-                ESP_LOGW(TAG, "Report not sent (wifi_mqtt=%s cellular_mqtt=%s)",
+                ESP_LOGW(TAG, "Report not sent (wifi_mqtt=%s cellular_mqtt=%s cellular_http=%s)",
                          mqtt_report_is_connected() ? "up" : "down",
 #if ENABLE_CELLULAR
-                         cellular_is_connected() ? "up" : "down"
+                         cellular_is_connected() ? "up" : "down",
+                         cellular_http_is_connected() ? "up" : "down"
 #else
+                         "disabled",
                          "disabled"
 #endif
                          );
+            }
+
+            // Safety net: cellular_http_json_body is only non-NULL when
+            // REPORT_TRANSPORT_CELLULAR_HTTP built it above and the switch
+            // case's cellular_http_publish() call didn't run/transfer
+            // ownership for some reason (e.g. a future early-return added
+            // between the build and the switch) - avoid a silent leak of a
+            // potentially large full-device JSON string.
+            if (cellular_http_json_body != NULL) {
+                free(cellular_http_json_body);
             }
 #else
             // device_list_mutex is already released unconditionally above,
@@ -601,7 +653,7 @@ static void run_normal_mode(wifi_credentials_t *creds) {
     // the same as report_task()'s send below - with reporting disabled
     // there's no point spinning up a task that just retries against
     // WiFi/the broker forever.
-    if (REPORT_TRANSPORT == REPORT_TRANSPORT_WIFI_ONLY) {
+    if (REPORT_TRANSPORT == REPORT_TRANSPORT_WIFI) {
         // mqtt_report_start_task() owns WiFi's (re)connection and the MQTT
         // client from here on, on its own background task - see
         // mqtt_report.h.
@@ -609,7 +661,7 @@ static void run_normal_mode(wifi_credentials_t *creds) {
     }
 
 #if ENABLE_CELLULAR
-    if (REPORT_TRANSPORT == REPORT_TRANSPORT_CELLULAR_ONLY) {
+    if (REPORT_TRANSPORT == REPORT_TRANSPORT_CELLULAR_MQTT) {
         // Cellular MQTT reporting (SIM7670G modem-side AT+CMQTT*) - actual
         // sending runs on cellular_task, its own background task -
         // report_task() only ever hands off the latest report via
@@ -618,6 +670,13 @@ static void run_normal_mode(wifi_credentials_t *creds) {
         // this one call - failures are logged from within cellular.c,
         // matching mqtt_report_start_task() above.
         cellular_start_task(device_id);
+    }
+    if (REPORT_TRANSPORT == REPORT_TRANSPORT_CELLULAR_HTTP) {
+        // Cellular HTTP reporting (SIM7670G modem-side AT+HTTP*, legacy
+        // full-device JSON format) - same "own background task, main.c
+        // doesn't need to know cellular internals" shape as
+        // cellular_start_task() above, see cellular_http.h.
+        cellular_http_start_task(device_id);
     }
 #endif
 #endif // !DISABLE_API_SEND

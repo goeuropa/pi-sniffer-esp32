@@ -90,6 +90,33 @@ static bool cellular_network_registered(void) {
 }
 
 /**
+ * AT+CGACT? - is PDP context 1 already active? Some networks (seen on a
+ * European "Plus"-APN SIM, unlike the US T-Mobile MVNO SIM this code was
+ * originally written against) auto-activate a default EPS bearer on cid 1
+ * as part of LTE attach, before this code ever sends AT+CGDCONT/AT+CGACT
+ * itself. Redefining an already-active cid 1 via AT+CGDCONT and then trying
+ * to activate it again gets rejected by the network with a generic
+ * "+CME ERROR: unknown error" (CME code 100 - it decodes fine, it just
+ * isn't specific) - not a malformed AT exchange, just nothing left to
+ * activate. Checked first so that case is skipped entirely instead of
+ * retried into the same rejection.
+ */
+static bool cellular_cid1_active(void) {
+    char resp[CELLULAR_AT_RESP_BUF_SIZE];
+    if (!modem_uart_send_at("AT+CGACT?", resp, sizeof(resp), CELLULAR_AT_TIMEOUT_MS)) {
+        return false;
+    }
+    // Response is one or more "+CGACT: <cid>,<state>" lines - find cid 1's.
+    for (char *p = strstr(resp, "+CGACT:"); p != NULL; p = strstr(p + 7, "+CGACT:")) {
+        int cid = 0, state = 0;
+        if (sscanf(p, "+CGACT: %d,%d", &cid, &state) == 2 && cid == 1) {
+            return state == 1;
+        }
+    }
+    return false;
+}
+
+/**
  * AT+CGDCONT + AT+CGACT - define the PDP context against CELLULAR_APN and
  * actually activate it. No PDP auth is sent - CELLULAR_APN (a T-Mobile MVNO
  * SIM) doesn't require a username/password, see plans/4g-integration.md's
@@ -109,6 +136,16 @@ static bool cellular_network_registered(void) {
  * succeed - dropping AT+NETOPEN (again) in favor of the explicit AT+CGACT
  * step this more specific document shows and this code was actually
  * missing.
+ *
+ * European "Plus"-APN deployment update: AT+CGACT=1,1 was seen failing
+ * there with "+CME ERROR: unknown error" right after a successful
+ * AT+CGDCONT, on a modem that AT+CEREG? already showed registered - see
+ * cellular_cid1_active()'s comment for the leading cause (network
+ * auto-activated cid 1 already) this now checks for and skips around. If
+ * cid 1 is active for some *other* reason (e.g. left in a stale state by a
+ * previous attempt/reflash) instead, one deactivate+retry is attempted
+ * before giving up, since a stuck context is otherwise permanent until a
+ * full modem power cycle.
  */
 static bool cellular_bring_up_pdp(void) {
     if (s_pdp_up) {
@@ -118,6 +155,13 @@ static bool cellular_bring_up_pdp(void) {
     if (!cellular_network_registered()) {
         ESP_LOGW(TAG, "Not registered on the LTE network yet (AT+CEREG?) - waiting for next attempt");
         return false;
+    }
+
+    if (cellular_cid1_active()) {
+        ESP_LOGI(TAG, "PDP context 1 already active (network auto-activated it on attach) - "
+                       "skipping AT+CGDCONT/AT+CGACT");
+        s_pdp_up = true;
+        return true;
     }
 
     char cmd[80];
@@ -132,8 +176,14 @@ static bool cellular_bring_up_pdp(void) {
 
     if (!modem_uart_send_at("AT+CGACT=1,1", resp, sizeof(resp), CELLULAR_AT_TIMEOUT_MS) ||
         strstr(resp, "OK") == NULL) {
-        ESP_LOGW(TAG, "AT+CGACT=1,1 failed: %s", resp);
-        return false;
+        ESP_LOGW(TAG, "AT+CGACT=1,1 failed (%s) - deactivating cid 1 and retrying once "
+                      "in case it's stuck from a previous attempt", resp);
+        modem_uart_send_at("AT+CGACT=0,1", resp, sizeof(resp), CELLULAR_AT_TIMEOUT_MS);
+        if (!modem_uart_send_at("AT+CGACT=1,1", resp, sizeof(resp), CELLULAR_AT_TIMEOUT_MS) ||
+            strstr(resp, "OK") == NULL) {
+            ESP_LOGW(TAG, "AT+CGACT=1,1 retry also failed: %s", resp);
+            return false;
+        }
     }
 
     // Diagnostic only, not a gate - confirms the PDP context actually got

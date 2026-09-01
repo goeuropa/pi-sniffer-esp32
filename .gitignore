@@ -8,6 +8,10 @@ dependencies.lock
 .idea/
 *.code-workspace
 
+# Deployment-specific secrets (real URLs/hostnames/APN) - see
+# include/secrets.h.example for the template to copy
+include/secrets.h
+
 # ESP-IDF
 sdkconfig
 sdkconfig.old

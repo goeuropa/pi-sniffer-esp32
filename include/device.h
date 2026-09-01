@@ -56,6 +56,38 @@ typedef enum {
 // Sentinel for ble_device_t.tx_power meaning "no TX Power AD field seen yet"
 #define TX_POWER_UNKNOWN INT8_MIN
 
+// Bytes of a stream_window_t's raw manufacturer payload kept for cross-
+// device content matching (see mac_pack_payload_matches()). Covers the
+// observed Handoff/Nearby Info payload lengths (typically 8-15 bytes);
+// longer payloads are truncated to this length before storing/comparing.
+#define STREAM_PAYLOAD_MAX_LEN 20
+
+// Tracks one Apple Continuity message type's own activity window on this
+// MAC, independent of the device's aggregate first_seen/last_seen. Lets
+// mac_pack.c tell a genuine same-stream collision (two physical devices)
+// apart from two different streams of the same phone overlapping during a
+// MAC rotation (a "ragged handover"). type == 0 means "unused slot" -
+// Continuity message type 0x00 never appears in apple_heuristic.c's switch.
+//
+// Also stores the most recent raw manufacturer payload for this type
+// (payload[0] == type). Several Continuity message types (Handoff, Instant
+// Hotspot, Nearby Info's trailing auth tag) carry several bytes of
+// effectively pseudo-random per-device/per-session content - two different
+// MACs broadcasting byte-identical payload content for the same type is far
+// stronger evidence of being the same physical device (maintaining two
+// concurrent BLE identities for that stream - an observed real iOS
+// behavior) than two independent devices coincidentally matching by chance.
+// mac_pack_payload_matches() uses this to override the windows-conflict
+// check, which alone can't distinguish "two devices broadcasting
+// concurrently" from "one device broadcasting concurrently on two MACs".
+typedef struct {
+    uint8_t type;
+    time_t first_seen;
+    time_t last_seen;
+    uint8_t payload[STREAM_PAYLOAD_MAX_LEN]; // most recent raw payload, payload[0] == type
+    uint8_t payload_len;                     // 0 = not captured; capped at STREAM_PAYLOAD_MAX_LEN
+} stream_window_t;
+
 /**
  * Structure representing a tracked BLE device
  */
@@ -88,6 +120,9 @@ typedef struct {
                                     // rotated its MAC to superseded_by
     uint8_t superseded_by[6];      // MAC of the newer device it rotated to (valid iff has_superseded_by)
     float superseded_probability;  // confidence 0.0-1.0 in that link
+
+    stream_window_t streams[MAC_PACK_MAX_TRACKED_STREAMS]; // per-Continuity-type windows, 0 = empty
+    uint8_t stream_count;                                   // populated slots in `streams`
 } ble_device_t;
 
 /**
@@ -114,6 +149,36 @@ typedef struct {
     int speakers;
     int other;
 } device_summary_t;
+
+/**
+ * Device count broken down by distance, within one category. Buckets match
+ * DISTANCE_BUCKET_NEAR_M/DISTANCE_BUCKET_MID_M (config.h): near = [0,
+ * DISTANCE_BUCKET_NEAR_M), mid = [DISTANCE_BUCKET_NEAR_M,
+ * DISTANCE_BUCKET_MID_M), far = [DISTANCE_BUCKET_MID_M, +inf).
+ */
+typedef struct {
+    int near;
+    int mid;
+    int far;
+} distance_breakdown_t;
+
+/**
+ * Per-category distance breakdown, parallel to device_summary_t (same
+ * categories, same "other" catch-all, same counting rules as
+ * device_get_summary() - see device_get_distance_summary()). Display-only -
+ * unlike device_summary_t, this isn't part of the reported JSON payload.
+ */
+typedef struct {
+    distance_breakdown_t phones;
+    distance_breakdown_t computers;
+    distance_breakdown_t wearables;
+    distance_breakdown_t tablets;
+    distance_breakdown_t beacons;
+    distance_breakdown_t watches;
+    distance_breakdown_t headphones;
+    distance_breakdown_t speakers;
+    distance_breakdown_t other;
+} device_distance_summary_t;
 
 /**
  * Initialize the device list
@@ -164,6 +229,22 @@ ble_device_t* device_update(device_list_t *list,
 void device_set_name(ble_device_t *device, const char *value, name_confidence_t confidence);
 
 /**
+ * Record that an Apple Continuity message of the given type was seen on this
+ * device right now, updating (or creating) that type's own activity window
+ * in device->streams independent of the device's aggregate first_seen/
+ * last_seen, and storing the raw payload (see stream_window_t) for later
+ * cross-device content matching. If the table is full and stream_type isn't
+ * already tracked, evicts the least-recently-seen tracked type to make room.
+ * @param device Pointer to the device
+ * @param stream_type Apple Continuity message type (payload[0])
+ * @param when Timestamp this message was observed
+ * @param payload Raw manufacturer payload (payload[0] == stream_type), can be NULL
+ * @param payload_len Length of payload; copied up to STREAM_PAYLOAD_MAX_LEN
+ */
+void device_record_stream(ble_device_t *device, uint8_t stream_type, time_t when,
+                           const uint8_t *payload, uint8_t payload_len);
+
+/**
  * Remove stale devices (not seen recently)
  * @param list Pointer to the device list
  * @param max_age_sec Remove devices not seen in this many seconds
@@ -186,11 +267,24 @@ float calculate_distance(int8_t rssi, int8_t tx_power);
 void device_categorize(ble_device_t *device);
 
 /**
- * Get summary statistics for the device list
+ * Get summary statistics for the device list. Skips devices with
+ * has_superseded_by set (already counted under their newer MAC), devices
+ * seen fewer than DEVICE_MIN_SEEN_COUNT_FOR_SUMMARY times (one-off noise,
+ * not enough evidence yet), and devices whose most recent RSSI is weaker
+ * than MIN_RSSI_FOR_SUMMARY (signal too weak to trust).
  * @param list Pointer to the device list
  * @param summary Pointer to summary structure to fill
  */
 void device_get_summary(const device_list_t *list, device_summary_t *summary);
+
+/**
+ * Get the per-category distance breakdown for the device list - same
+ * counting rules as device_get_summary() (see its doc comment), just
+ * additionally bucketed by distance within each category.
+ * @param list Pointer to the device list
+ * @param summary Pointer to distance-summary structure to fill
+ */
+void device_get_distance_summary(const device_list_t *list, device_distance_summary_t *summary);
 
 /**
  * Convert MAC bytes to string

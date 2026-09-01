@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS 
+    SRCS
         "main.c"
         "kalman.c"
         "device.c"
@@ -11,16 +11,24 @@ idf_component_register(
         "captive_dns.c"
         "button_handler.c"
         "http_client.c"
-    INCLUDE_DIRS 
+        "device_json.c"
+        "gnss.c"
+        "modem_uart.c"
+        "cellular.c"
+        "cellular_http.c"
+        "report_throttle.c"
+        "mqtt_report.c"
+    INCLUDE_DIRS
         "."
         "../include"
-    REQUIRES 
-        bt 
-        nvs_flash 
-        esp_wifi 
-        esp_netif 
+    REQUIRES
+        bt
+        nvs_flash
+        esp_wifi
+        esp_netif
         esp_http_client
         esp_http_server
+        mqtt
         json
         driver
 )

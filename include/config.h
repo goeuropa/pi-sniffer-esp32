@@ -16,12 +16,12 @@
 #define WIFI_MAX_RETRY      10
 
 // ============================================================================
-#define API_URL             "https://3334.xomnghien.com/api/devices"
+#define API_URL             "your_api_endpoint_here"
 #define API_TIMEOUT_MS      10000
 // Skip SSL certificate verification (e.g. for self-signed certs)
 #define API_SKIP_CERT_CHECK 1
 // Disable sending device data to the API (set to 1 to disable, 0 to enable)
-#define DISABLE_API_SEND    1
+#define DISABLE_API_SEND    0
 
 // ============================================================================
 // BLE Scanning Configuration
